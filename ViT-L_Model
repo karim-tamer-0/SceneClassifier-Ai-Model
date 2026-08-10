@@ -1,0 +1,635 @@
+
+
+import os, gc, math, random
+import numpy as np
+import pandas as pd
+from PIL import Image
+from collections import Counter
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.amp import autocast, GradScaler
+import torchvision.transforms as transforms
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+import timm
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+SEED          = 42
+IMG_SIZE      = 224
+BATCH_SIZE    = 32        # 16 per T4 × 2 GPUs
+ACCUM_STEPS   = 2         # effective batch = 64
+NUM_CLASSES   = 17
+EPOCHS        = 35
+WARMUP_EPOCHS = 2
+
+# Only 2 stages — backbone is FREE after just 3 epochs
+UNFREEZE_SCHEDULE = {0: "head", 3: "all"}
+
+TRAIN_DIR  = '/kaggle/input/competitions/cse-281-spring-26-scene-style-classification/StyleClassificationIndoors/StyleClassificationIndoors/train'
+TEST_DIR   = '/kaggle/input/competitions/cse-281-spring-26-scene-style-classification/StyleClassificationIndoors/StyleClassificationIndoors/test'
+SAMPLE_SUB = '/kaggle/input/competitions/cse-281-spring-26-scene-style-classification/sample_submission.csv'
+OUTPUT_DIR = '/kaggle/working'
+
+LABEL_MAP = {
+    "asian": 0, "boho": 1, "coastal": 2, "contemporary": 3,
+    "craftsman": 4, "eclectic": 5, "farmhouse": 6, "french-country": 7,
+    "industrial": 8, "mediterranean": 9, "minimalist": 10, "modern": 11,
+    "scandinavian": 12, "shabby-chic-style": 13, "southwestern": 14,
+    "tropical": 15, "victorian": 16,
+}
+IDX_TO_CLASS = {v: k for k, v in LABEL_MAP.items()}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEED + DEVICE
+# ─────────────────────────────────────────────────────────────────────────────
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+set_seed()
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+N_GPUS = torch.cuda.device_count()
+USE_DP = N_GPUS > 1
+
+print(f"Device : {DEVICE}")
+print(f"GPUs   : {N_GPUS}  {'(DataParallel ON)' if USE_DP else ''}")
+for i in range(N_GPUS):
+    p = torch.cuda.get_device_properties(i)
+    print(f"  GPU{i} : {p.name}  {p.total_memory/1e9:.1f} GB")
+
+def free_memory():
+    gc.collect()
+    torch.cuda.empty_cache()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SANITY CHECK
+# ─────────────────────────────────────────────────────────────────────────────
+def sanity_check():
+    print("\n── Sanity check ──────────────────────────────────")
+    sample = pd.read_csv(SAMPLE_SUB)
+    print("sample_submission columns:", list(sample.columns))
+    print(sample.head(3).to_string())
+    print("\nLABEL_MAP:")
+    for k, v in LABEL_MAP.items():
+        print(f"  {v:2d} → {k}")
+    missing = 0
+    for img in sample["ImageName"].head(10):
+        if not os.path.exists(os.path.join(TEST_DIR, img)):
+            print(f"  !! MISSING: {img}")
+            missing += 1
+    if missing == 0:
+        print("  ✓ First 10 test images exist")
+    print("──────────────────────────────────────────────────\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSFORMS
+# ─────────────────────────────────────────────────────────────────────────────
+MEAN = [0.485, 0.456, 0.406]
+STD  = [0.229, 0.224, 0.225]
+
+train_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE + 32, IMG_SIZE + 32)),
+    transforms.RandomCrop(IMG_SIZE),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.05),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.08),
+    transforms.RandomGrayscale(p=0.03),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.25),
+    transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+    transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+])
+
+TTA_TRANSFORMS = [
+    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                        transforms.RandomHorizontalFlip(p=1.0),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((IMG_SIZE+32, IMG_SIZE+32)),
+                        transforms.CenterCrop(IMG_SIZE),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((IMG_SIZE+32, IMG_SIZE+32)),
+                        transforms.CenterCrop(IMG_SIZE),
+                        transforms.RandomHorizontalFlip(p=1.0),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                        transforms.ColorJitter(brightness=0.15),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                        transforms.ColorJitter(contrast=0.15),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                        transforms.ColorJitter(saturation=0.15),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((IMG_SIZE+16, IMG_SIZE+16)),
+                        transforms.RandomRotation(5),
+                        transforms.CenterCrop(IMG_SIZE),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATASET
+# ─────────────────────────────────────────────────────────────────────────────
+class StyleDataset(Dataset):
+    def __init__(self, dataframe, img_dir, transform=None, is_test=False):
+        self.df        = dataframe.reset_index(drop=True)
+        self.img_dir   = img_dir
+        self.transform = transform
+        self.is_test   = is_test
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.loc[idx]
+        try:
+            image = Image.open(
+                os.path.join(self.img_dir, row["ImageName"])
+            ).convert("RGB")
+        except Exception:
+            image = Image.new("RGB", (IMG_SIZE, IMG_SIZE), 0)
+        if self.transform:
+            image = self.transform(image)
+        if self.is_test:
+            return image, row["ImageName"]
+        return image, int(row["ClassLabel"])
+
+
+def build_dataframe(root_dir):
+    records = []
+    for class_name, label in LABEL_MAP.items():
+        class_dir = os.path.join(root_dir, class_name)
+        if not os.path.isdir(class_dir):
+            continue
+        for fname in os.listdir(class_dir):
+            if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                records.append({"ImageName": os.path.join(class_name, fname),
+                                "ClassLabel": label})
+    df = pd.DataFrame(records)
+    print(f"Training images found: {len(df)}")
+    return df
+
+
+def make_balanced_sampler(df):
+    counts  = Counter(df["ClassLabel"].tolist())
+    weights = [1.0 / counts[int(l)] for l in df["ClassLabel"]]
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+class ViTLarge(nn.Module):
+    def __init__(self, num_classes=NUM_CLASSES, pretrained=True):
+        super().__init__()
+        self.backbone = timm.create_model(
+            "vit_large_patch16_224.augreg_in21k_ft_in1k",
+            pretrained=pretrained,
+            num_classes=0,
+        )
+        feat_dim = self.backbone.num_features  # 1024
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Linear(feat_dim, 512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes),
+        )
+        self._init_head()
+
+    def _init_head(self):
+        for m in self.head:
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.head(self.backbone(x))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROGRESSIVE UNFREEZING — 2 stages only
+# ─────────────────────────────────────────────────────────────────────────────
+def set_freeze_stage(model, stage):
+    """
+    'head' : backbone frozen, head trains  (epochs 0-2 only — 3 epochs max)
+    'all'  : ZERO frozen layers, full 307M trainable (epoch 3 onwards)
+    """
+    raw = model.module if isinstance(model, nn.DataParallel) else model
+
+    if stage == "head":
+        for p in raw.backbone.parameters():
+            p.requires_grad = False
+        for p in raw.head.parameters():
+            p.requires_grad = True
+
+    elif stage == "all":
+        for p in raw.parameters():
+            p.requires_grad = True   # everything — no exceptions
+
+    trainable = sum(p.numel() for p in raw.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in raw.parameters())
+    print(f"  [{stage}] trainable: {trainable/1e6:.1f}M / {total/1e6:.1f}M  "
+          f"({'FULLY OPEN' if stage == 'all' else 'head only'})")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIMIZER — differential LR (replaces freezing as regularizer)
+# ─────────────────────────────────────────────────────────────────────────────
+def build_optimizer(model, stage):
+    raw    = model.module if isinstance(model, nn.DataParallel) else model
+    blocks = list(raw.backbone.blocks.children())  # 24 blocks in ViT-L
+    n      = len(blocks)
+
+    if stage == "head":
+        # Only head params are trainable at this stage
+        params = [p for p in raw.parameters() if p.requires_grad]
+        return optim.AdamW(params, lr=1e-3, weight_decay=0.05)
+
+    else:  # "all" — 4-tier differential LR, zero freezing
+        # Tier 1 (deepest): patch embed + pos embed + cls + blocks 0-11
+        deep_ids  = {id(p) for blk in blocks[:n//2] for p in blk.parameters()}
+        deep_ids |= {id(p) for p in raw.backbone.patch_embed.parameters()}
+        if hasattr(raw.backbone, 'cls_token'):
+            deep_ids.add(id(raw.backbone.cls_token))
+        if hasattr(raw.backbone, 'pos_embed'):
+            deep_ids.add(id(raw.backbone.pos_embed))
+
+        # Tier 2 (mid): blocks 12-19
+        mid_ids = {id(p) for blk in blocks[n//2: n - n//4]
+                   for p in blk.parameters()}
+
+        # Tier 3 (top): blocks 20-23 + final norm
+        top_ids  = {id(p) for blk in blocks[n - n//4:] for p in blk.parameters()}
+        top_ids |= {id(p) for p in raw.backbone.norm.parameters()}
+
+        # Tier 4: head (highest LR)
+        head_ids = {id(p) for p in raw.head.parameters()}
+
+        all_bb = list(raw.backbone.parameters())
+        deep_p = [p for p in all_bb if id(p) in deep_ids]
+        mid_p  = [p for p in all_bb if id(p) in mid_ids]
+        top_p  = [p for p in all_bb if id(p) in top_ids]
+        head_p = list(raw.head.parameters())
+
+        # Any backbone param not bucketed above gets mid LR (safe fallback)
+        bucketed = deep_ids | mid_ids | top_ids
+        rest_p   = [p for p in all_bb if id(p) not in bucketed]
+
+        return optim.AdamW([g for g in [
+            {"params": deep_p, "lr": 5e-7},
+            {"params": mid_p,  "lr": 5e-6},
+            {"params": rest_p, "lr": 5e-6},
+            {"params": top_p,  "lr": 2e-5},
+            {"params": head_p, "lr": 1e-3},
+        ] if len(g["params"]) > 0], weight_decay=0.05)  # filter empty groups
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOSS
+# ─────────────────────────────────────────────────────────────────────────────
+class LabelSmoothingCE(nn.Module):
+    def __init__(self, smoothing=0.1):
+        super().__init__()
+        self.smoothing = smoothing
+
+    def forward(self, pred, target):
+        n        = pred.size(1)
+        log_prob = F.log_softmax(pred, dim=1)
+        with torch.no_grad():
+            smooth = torch.full_like(pred, self.smoothing / (n - 1))
+            smooth.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+        return -(smooth * log_prob).sum(dim=1).mean()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUTMIX + MIXUP
+# ─────────────────────────────────────────────────────────────────────────────
+def rand_bbox(size, lam):
+    W, H  = size[2], size[3]
+    cut_w = int(W * math.sqrt(1.0 - lam))
+    cut_h = int(H * math.sqrt(1.0 - lam))
+    cx    = random.randint(0, W);  cy = random.randint(0, H)
+    x1    = max(cx - cut_w // 2, 0);  x2 = min(cx + cut_w // 2, W)
+    y1    = max(cy - cut_h // 2, 0);  y2 = min(cy + cut_h // 2, H)
+    return x1, y1, x2, y2
+
+def cutmix(images, labels, alpha=1.0):
+    lam             = np.random.beta(alpha, alpha)
+    idx             = torch.randperm(images.size(0), device=images.device)
+    x1, y1, x2, y2 = rand_bbox(images.size(), lam)
+    images          = images.clone()
+    images[:, :, x1:x2, y1:y2] = images[idx, :, x1:x2, y1:y2]
+    lam = 1 - (x2-x1)*(y2-y1) / (images.size(2)*images.size(3))
+    return images, labels, labels[idx], lam
+
+def mixup(images, labels, alpha=0.4):
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(images.size(0), device=images.device)
+    return lam*images + (1-lam)*images[idx], labels, labels[idx], lam
+
+def mixed_loss(criterion, pred, ya, yb, lam):
+    return lam * criterion(pred, ya) + (1 - lam) * criterion(pred, yb)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEDULER — linear warmup then cosine with 3 restarts (step-level)
+# ─────────────────────────────────────────────────────────────────────────────
+def make_scheduler(optimizer, warmup_steps, total_steps):
+    restart_every = max((total_steps - warmup_steps) // 3, 1)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return (step + 1) / max(warmup_steps, 1)
+        s = step - warmup_steps
+        return 0.5 * (1 + math.cos(math.pi * (s % restart_every) / restart_every))
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAIN ONE EPOCH
+# ─────────────────────────────────────────────────────────────────────────────
+def train_epoch(model, loader, optimizer, scheduler, scaler, criterion, epoch):
+    model.train()
+    correct = total = 0
+    loss_sum = 0.0
+    optimizer.zero_grad()
+    last_step_flushed = False  # ← ADD THIS
+
+    for step, (images, labels) in enumerate(loader):
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+        roll = random.random()
+        if epoch >= 3 and roll < 0.35:
+            images, ya, yb, lam = cutmix(images, labels)
+            use_aug = True
+        elif epoch >= 3 and roll < 0.65:
+            images, ya, yb, lam = mixup(images, labels)
+            use_aug = True
+        else:
+            ya = yb = labels; lam = 1.0; use_aug = False
+
+        with autocast("cuda"):
+            out  = model(images)
+            loss = (mixed_loss(criterion, out, ya, yb, lam) if use_aug
+                    else criterion(out, labels)) / ACCUM_STEPS
+
+        scaler.scale(loss).backward()
+
+        if (step + 1) % ACCUM_STEPS == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step()
+            last_step_flushed = True   # ← MARK AS FLUSHED
+        else:
+            last_step_flushed = False  # ← RESET
+
+        correct  += (out.detach().argmax(1) == labels).sum().item()
+        total    += labels.size(0)
+        loss_sum += loss.item() * ACCUM_STEPS * labels.size(0)
+
+    # Only flush if the last batch left un-accumulated gradients
+    if not last_step_flushed:                          # ← GUARD
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+    return correct / total * 100, loss_sum / total
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATE
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def validate(model, loader, criterion):
+    model.eval()
+    correct = total = loss_sum = 0
+    for images, labels in loader:
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+        with autocast("cuda"):
+            out  = model(images)
+            loss = criterion(out, labels)
+        correct  += (out.argmax(1) == labels).sum().item()
+        total    += labels.size(0)
+        loss_sum += loss.item() * labels.size(0)
+    return correct / total * 100, loss_sum / total
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FULL TRAINING LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+def train(train_df, val_df):
+    print("\n" + "=" * 60)
+    print(f"  ViT-L/16  |  {IMG_SIZE}px  |  {N_GPUS} GPU(s)  |  2-stage unfreeze")
+    print(f"  Frozen epochs: 0-2 (head only) → epoch 3: FULLY OPEN")
+    print("=" * 60)
+
+    sampler      = make_balanced_sampler(train_df)
+    train_loader = DataLoader(
+        StyleDataset(train_df, TRAIN_DIR, train_transform),
+        batch_size=BATCH_SIZE, sampler=sampler,
+        num_workers=4, pin_memory=True, drop_last=True,
+    )
+    val_loader = DataLoader(
+        StyleDataset(val_df, TRAIN_DIR, val_transform),
+        batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=4, pin_memory=True,
+    )
+
+    steps_per_epoch = len(train_loader)
+    total_steps     = EPOCHS * steps_per_epoch
+    warmup_steps    = WARMUP_EPOCHS * steps_per_epoch
+
+    raw_model = ViTLarge(pretrained=True).to(DEVICE)
+    model     = nn.DataParallel(raw_model) if USE_DP else raw_model
+    scaler    = GradScaler()  # no args — works across all PyTorch versions
+    criterion = LabelSmoothingCE(smoothing=0.1)
+
+    best_val_acc  = 0.0
+    best_path     = os.path.join(OUTPUT_DIR, "best_vitl.pth")
+    patience_ctr  = 0
+    PATIENCE      = 10
+    current_stage = None
+    optimizer     = None
+    scheduler     = None
+
+    for epoch in range(EPOCHS):
+
+        # ── Progressive unfreeze ──────────────────────────────────────────────
+        new_stage = current_stage
+        for e, stage in sorted(UNFREEZE_SCHEDULE.items()):
+            if epoch >= e:
+                new_stage = stage
+
+        if new_stage != current_stage:
+            current_stage = new_stage
+            print(f"\n→ Epoch {epoch+1}: switching to '{current_stage}'")
+            set_freeze_stage(model, current_stage)
+            optimizer  = build_optimizer(model, current_stage)
+            elapsed        = epoch * steps_per_epoch
+            remaining      = total_steps - elapsed
+            remaining_warm = max(warmup_steps - elapsed, 0)
+            scheduler      = make_scheduler(optimizer, remaining_warm, remaining)
+
+        # ── Train + validate ──────────────────────────────────────────────────
+        train_acc, train_loss = train_epoch(
+            model, train_loader, optimizer, scheduler, scaler, criterion, epoch)
+        val_acc, val_loss = validate(model, val_loader, criterion)
+
+        cur_lr = optimizer.param_groups[-1]["lr"]
+        print(f"  E{epoch+1:02d} | {current_stage:5s} | "
+              f"Train {train_acc:.1f}% ({train_loss:.4f}) | "
+              f"Val {val_acc:.2f}% ({val_loss:.4f}) | LR {cur_lr:.2e}")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            raw = model.module if isinstance(model, nn.DataParallel) else model
+            torch.save(raw.state_dict(), best_path)
+            patience_ctr = 0
+            print(f"    ✓ New best: {best_val_acc:.2f}%")
+        else:
+            patience_ctr += 1
+            if patience_ctr >= PATIENCE:
+                print(f"    Early stop at epoch {epoch+1}")
+                break
+
+    print(f"\nBest val accuracy: {best_val_acc:.2f}%")
+    del model;  free_memory()
+    return best_path, best_val_acc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TTA INFERENCE + SUBMISSION
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def generate_submission(model_path):
+    print("\nGenerating submission with 8-crop TTA...")
+    sample = pd.read_csv(SAMPLE_SUB)
+
+    model = ViTLarge(pretrained=False).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
+    if USE_DP:
+        model = nn.DataParallel(model)
+    model.eval()
+
+    final_logits = torch.zeros(len(sample), NUM_CLASSES)
+
+    for idx, row in sample.iterrows():
+        try:
+            img = Image.open(os.path.join(TEST_DIR, row["ImageName"])).convert("RGB")
+        except Exception:
+            continue
+        logits = torch.zeros(1, NUM_CLASSES).to(DEVICE)
+        for tfm in TTA_TRANSFORMS:
+            with autocast("cuda"):
+                logits += model(tfm(img).unsqueeze(0).to(DEVICE))
+        logits /= len(TTA_TRANSFORMS)
+        final_logits[idx] = logits.squeeze().cpu().float()
+        if idx % 500 == 0:
+            print(f"  TTA {idx}/{len(sample)}")
+
+    del model;  free_memory()
+
+    pred_indices = final_logits.argmax(dim=1).numpy()
+
+    # Auto-detect if Kaggle wants string names or integers
+    sample_labels = sample.get("ClassLabel", None)
+    if sample_labels is not None and sample_labels.dtype == object:
+        pred_labels = [IDX_TO_CLASS[i] for i in pred_indices]
+        print("  Format: class NAME strings")
+    else:
+        pred_labels = pred_indices.tolist()
+        print("  Format: integer indices")
+
+    out_path = os.path.join(OUTPUT_DIR, "submission.csv")
+    pd.DataFrame({"ImageName": sample["ImageName"],
+                  "ClassLabel": pred_labels}).to_csv(out_path, index=False)
+
+    print(f"\nSubmission saved → {out_path}  ({len(pred_labels)} rows)")
+    for label, count in sorted(Counter(pred_indices.tolist()).items()):
+        print(f"  {IDX_TO_CLASS[label]:25s}: {count}")
+    return out_path
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVALUATION
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def evaluate(model_path, val_df):
+    print("\nEvaluation on held-out val set...")
+    model = ViTLarge(pretrained=False).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
+    model.eval()
+
+    loader = DataLoader(
+        StyleDataset(val_df, TRAIN_DIR, val_transform),
+        batch_size=BATCH_SIZE, shuffle=False, num_workers=4,
+    )
+    preds, labels_all = [], []
+    for imgs, lbls in loader:
+        with autocast("cuda"):
+            out = model(imgs.to(DEVICE))
+        preds.extend(out.argmax(1).cpu().numpy())
+        labels_all.extend(lbls.numpy())
+
+    del model;  free_memory()
+
+    acc = accuracy_score(labels_all, preds) * 100
+    print(f"\nVal Accuracy : {acc:.2f}%")
+    print(classification_report(labels_all, preds,
+                                 target_names=list(LABEL_MAP.keys())))
+
+    cm = confusion_matrix(labels_all, preds)
+    plt.figure(figsize=(16, 14))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=list(LABEL_MAP.keys()),
+                yticklabels=list(LABEL_MAP.keys()))
+    plt.title(f"Confusion Matrix — Val {acc:.2f}%", fontsize=14)
+    plt.xlabel("Predicted");  plt.ylabel("Actual")
+    plt.xticks(rotation=45, ha="right");  plt.tight_layout()
+    cm_path = os.path.join(OUTPUT_DIR, "confusion_matrix.png")
+    plt.savefig(cm_path, dpi=150);  plt.show()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  ViT-L/16 (ImageNet-21k)  |  17-class Indoor Style")
+    print("  2-stage unfreeze: head(0-2) → ALL(3+)")
+    print("=" * 60)
+
+    sanity_check()
+
+    df = build_dataframe(TRAIN_DIR)
+    df = df.sample(frac=1, random_state=SEED).reset_index(drop=True)
+
+    train_df, val_df = train_test_split(
+        df, test_size=0.10, stratify=df["ClassLabel"], random_state=SEED)
+    train_df = train_df.reset_index(drop=True)
+    val_df   = val_df.reset_index(drop=True)
+    print(f"Train: {len(train_df)} | Val: {len(val_df)}")
+
+    best_path, best_acc = train(train_df, val_df)
+    evaluate(best_path, val_df)
+    generate_submission(best_path)
+
+    print(f"\nDone! Best val acc: {best_acc:.2f}%")
+    print("Download /kaggle/working/submission.csv and submit.")
