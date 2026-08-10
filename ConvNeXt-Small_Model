@@ -1,0 +1,545 @@
+import os, copy, random, math, numpy as np, torch, torch.nn as nn, torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, SubsetRandomSampler
+from torchvision import datasets, transforms
+from torchvision.models import ConvNeXt_Small_Weights   # upgraded to Small
+from torchvision.ops import StochasticDepth
+from sklearn.model_selection import StratifiedKFold
+import pandas as pd
+from PIL import Image
+from collections import Counter
+from typing import List
+
+# ═══════════════════════════════════════════════════════════════════
+# 1.  Paths & GPU
+# ═══════════════════════════════════════════════════════════════════
+BASE_DIR        = '.'
+TRAIN_DIR       = os.path.join(BASE_DIR, 'dataset', 'train')
+TEST_DIR        = os.path.join(BASE_DIR, 'dataset', 'test')
+SAMPLE_SUB_PATH = os.path.join(BASE_DIR, 'sample_submission.csv')
+OUTPUT_DIR      = '.'
+
+torch.backends.cudnn.benchmark = True
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+if device.type == 'cuda':
+    print(f"  GPU : {torch.cuda.get_device_name(0)}")
+    print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+# ═══════════════════════════════════════════════════════════════════
+# 2.  Transforms  (512 × 512)
+# ═══════════════════════════════════════════════════════════════════
+IMG_SIZE = 512
+MEAN     = [0.485, 0.456, 0.406]
+STD      = [0.229, 0.224, 0.225]
+ZOOM     = IMG_SIZE + 64    # 576
+
+train_transforms = transforms.Compose([
+    transforms.Resize((ZOOM, ZOOM)),
+    transforms.RandomCrop(IMG_SIZE),
+    transforms.TrivialAugmentWide(),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(degrees=10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15, hue=0.05),
+    transforms.RandomGrayscale(p=0.05),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+    transforms.RandomErasing(p=0.25, scale=(0.02, 0.20)),
+])
+
+val_transforms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+])
+
+# ── 8‑view TTA  ─────────────────────────────────────────────────────
+def _corner_crop(top: int, left: int):
+    return transforms.Lambda(
+        lambda img: transforms.functional.crop(img, top, left, IMG_SIZE, IMG_SIZE)
+    )
+
+TTA_TRANSFORMS = [
+    # 1. centre
+    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    # 2. centre + h‑flip
+    transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                        transforms.RandomHorizontalFlip(p=1.0),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    # 3. zoom → centre crop
+    transforms.Compose([transforms.Resize((ZOOM, ZOOM)),
+                        transforms.CenterCrop(IMG_SIZE),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    # 4. zoom → centre crop + h‑flip
+    transforms.Compose([transforms.Resize((ZOOM, ZOOM)),
+                        transforms.CenterCrop(IMG_SIZE),
+                        transforms.RandomHorizontalFlip(p=1.0),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    # 5‑8. four corners of the zoomed image
+    transforms.Compose([transforms.Resize((ZOOM, ZOOM)),
+                        _corner_crop(0, 0),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((ZOOM, ZOOM)),
+                        _corner_crop(0, ZOOM - IMG_SIZE),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((ZOOM, ZOOM)),
+                        _corner_crop(ZOOM - IMG_SIZE, 0),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+    transforms.Compose([transforms.Resize((ZOOM, ZOOM)),
+                        _corner_crop(ZOOM - IMG_SIZE, ZOOM - IMG_SIZE),
+                        transforms.ToTensor(), transforms.Normalize(MEAN, STD)]),
+]
+N_TTA = len(TTA_TRANSFORMS)  # 8
+
+# ═══════════════════════════════════════════════════════════════════
+# 3.  Architecture  ─  ConvNeXt‑Small  +  GeM  +  MLP head
+# ═══════════════════════════════════════════════════════════════════
+class Permute(nn.Module):
+    def __init__(self, dims: List[int]):
+        super().__init__()
+        self.dims = dims
+    def forward(self, x):
+        return torch.permute(x, self.dims)
+
+class LayerNorm2d(nn.LayerNorm):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        x = x.permute(0, 3, 1, 2)
+        return x
+
+class GeM(nn.Module):
+    def __init__(self, p: float = 3.0, eps: float = 1e-6):
+        super().__init__()
+        self.p   = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.adaptive_avg_pool2d(x.clamp(min=self.eps).pow(self.p), (1, 1)).pow(1.0 / self.p)
+
+class CNBlock(nn.Module):
+    def __init__(self, dim: int, layer_scale: float = 1e-6,
+                 stochastic_depth_prob: float = 0.0):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim, bias=True),
+            Permute([0, 2, 3, 1]),
+            nn.LayerNorm(dim, eps=1e-6),
+            nn.Linear(dim, 4 * dim, bias=True),
+            nn.GELU(),
+            nn.Linear(4 * dim, dim, bias=True),
+            Permute([0, 3, 1, 2]),
+        )
+        self.layer_scale      = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
+        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.stochastic_depth(self.layer_scale * self.block(x))
+
+class ConvNeXt_WhiteBox(nn.Module):
+    """
+    Configurable ConvNeXt backbone.
+    Default: Small  (depths=[3,3,27,3], dims=[96,192,384,768])
+    use_mlp_head=True  → 2‑layer MLP head (768→384→num_classes)
+    use_mlp_head=False → standard linear head (768→num_classes)
+    """
+    def __init__(self, num_classes: int = 1000,
+                 depths: List[int] = None,
+                 dims:   List[int] = None,
+                 dp_max: float     = 0.3,
+                 use_mlp_head: bool = True):
+        super().__init__()
+        depths   = depths or [3, 3, 27, 3]    # Small default
+        dims     = dims   or [96, 192, 384, 768]
+        dp_rates = [x.item() for x in torch.linspace(0, dp_max, sum(depths))]
+
+        layers = [nn.Sequential(
+            nn.Conv2d(3, dims[0], kernel_size=4, stride=4),
+            LayerNorm2d(dims[0], eps=1e-6)
+        )]
+        cur = 0
+        for i in range(4):
+            layers.append(nn.Sequential(*[
+                CNBlock(dims[i], stochastic_depth_prob=dp_rates[cur + j])
+                for j in range(depths[i])
+            ]))
+            cur += depths[i]
+            if i < 3:
+                layers.append(nn.Sequential(
+                    LayerNorm2d(dims[i], eps=1e-6),
+                    nn.Conv2d(dims[i], dims[i + 1], kernel_size=2, stride=2)
+                ))
+
+        self.features = nn.Sequential(*layers)
+        self.gem_pool = GeM()
+
+        if use_mlp_head:
+            self.classifier = nn.Sequential(
+                LayerNorm2d(dims[-1], eps=1e-6),
+                nn.Flatten(1),
+                nn.Linear(dims[-1], 384),
+                nn.GELU(),
+                nn.Dropout(p=0.35),
+                nn.Linear(384, num_classes),
+            )
+        else:
+            # Standard head – needed to load pretrained weights correctly
+            self.classifier = nn.Sequential(
+                LayerNorm2d(dims[-1], eps=1e-6),
+                nn.Flatten(1),
+                nn.Linear(dims[-1], num_classes),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.gem_pool(x)
+        x = self.classifier(x)
+        return x
+
+# ═══════════════════════════════════════════════════════════════════
+# 4.  create_model  —  ConvNeXt‑Small  +  LLRD param groups
+# ═══════════════════════════════════════════════════════════════════
+LLRD_DECAY = 0.65
+
+def create_model(head_lr: float = 2e-4):
+    # 1) Build with a standard head that matches the pretrained checkpoint
+    model = ConvNeXt_WhiteBox(num_classes=1000, use_mlp_head=False)
+
+    # 2) Load ConvNeXt‑Small ImageNet‑1k weights
+    state_dict = ConvNeXt_Small_Weights.DEFAULT.get_state_dict(progress=True)
+    model.load_state_dict(state_dict, strict=False)   # Will match exactly now
+
+    # 3) Replace classifier with the MLP head for our task
+    model.classifier = nn.Sequential(
+        LayerNorm2d(768, eps=1e-6),
+        nn.Flatten(1),
+        nn.Linear(768, 384),
+        nn.GELU(),
+        nn.Dropout(p=0.35),
+        nn.Linear(384, 17),
+    )
+
+    # 4) Unfreeze everything – LLRD controls stability
+    for p in model.parameters():
+        p.requires_grad = True
+
+    # 5) LLRD parameter groups
+    stage_lr_map = [
+        ('features.0',  head_lr * LLRD_DECAY ** 5),
+        ('features.1',  head_lr * LLRD_DECAY ** 4),
+        ('features.2',  head_lr * LLRD_DECAY ** 4),
+        ('features.3',  head_lr * LLRD_DECAY ** 3),
+        ('features.4',  head_lr * LLRD_DECAY ** 3),
+        ('features.5',  head_lr * LLRD_DECAY ** 2),
+        ('features.6',  head_lr * LLRD_DECAY ** 2),
+        ('features.7',  head_lr * LLRD_DECAY ** 1),
+        ('gem_pool',    head_lr),
+        ('classifier',  head_lr),
+    ]
+
+    assigned_ids  = set()
+    param_groups  = []
+    base_lrs      = []
+    for prefix, lr in stage_lr_map:
+        group = [p for n, p in model.named_parameters()
+                 if n.startswith(prefix) and id(p) not in assigned_ids]
+        for p in group:
+            assigned_ids.add(id(p))
+        if group:
+            param_groups.append({'params': group, 'lr': lr})
+            base_lrs.append(lr)
+
+    return model.to(device), param_groups, base_lrs
+
+# ═══════════════════════════════════════════════════════════════════
+# 5.  EMA
+# ═══════════════════════════════════════════════════════════════════
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.9998):
+        self.ema   = copy.deepcopy(model).eval()
+        self.decay = decay
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        msd, esd = model.state_dict(), self.ema.state_dict()
+        for k in esd:
+            if esd[k].is_floating_point():
+                esd[k].mul_(self.decay).add_(msd[k].detach().float() * (1.0 - self.decay))
+
+# ═══════════════════════════════════════════════════════════════════
+# 6.  MixUp / CutMix
+# ═══════════════════════════════════════════════════════════════════
+def _rand_bbox(size, lam):
+    W, H    = size[-2], size[-1]
+    cut_rat = np.sqrt(1.0 - lam)
+    cw, ch  = int(W * cut_rat), int(H * cut_rat)
+    cx, cy  = np.random.randint(W), np.random.randint(H)
+    x1 = np.clip(cx - cw // 2, 0, W); x2 = np.clip(cx + cw // 2, 0, W)
+    y1 = np.clip(cy - ch // 2, 0, H); y2 = np.clip(cy + ch // 2, 0, H)
+    return x1, y1, x2, y2
+
+def mixup_cutmix(batch: torch.Tensor, targets: torch.Tensor, alpha: float = 0.8):
+    lam     = np.random.beta(alpha, alpha)
+    idx     = torch.randperm(batch.size(0), device=batch.device)
+    shufl_b = batch[idx]
+    shufl_t = targets[idx]
+
+    if random.random() < 0.5:                           # MixUp
+        mixed = lam * batch + (1.0 - lam) * shufl_b
+    else:                                               # CutMix
+        x1, y1, x2, y2 = _rand_bbox(batch.shape, lam)
+        mixed = batch.clone()
+        mixed[:, :, x1:x2, y1:y2] = shufl_b[:, :, x1:x2, y1:y2]
+        lam = 1.0 - (x2 - x1) * (y2 - y1) / (batch.size(-2) * batch.size(-1))
+
+    return mixed, targets, shufl_t, lam
+
+def mix_criterion(crit, pred, y_a, y_b, lam):
+    return lam * crit(pred, y_a) + (1.0 - lam) * crit(pred, y_b)
+
+# ═══════════════════════════════════════════════════════════════════
+# 7.  Focal Loss
+# ═══════════════════════════════════════════════════════════════════
+class FocalLoss(nn.Module):
+    def __init__(self, gamma: float = 2.0, weight=None, label_smoothing: float = 0.1):
+        super().__init__()
+        self.gamma           = gamma
+        self.weight          = weight
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce  = F.cross_entropy(logits, targets, weight=self.weight,
+                               label_smoothing=self.label_smoothing, reduction='none')
+        pt  = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
+
+# ═══════════════════════════════════════════════════════════════════
+# 8.  LR schedule helper
+# ═══════════════════════════════════════════════════════════════════
+def cosine_warmup_lr(epoch: int, warmup: int, total: int, base: float) -> float:
+    if epoch < warmup:
+        return base * (epoch + 1) / warmup
+    progress = (epoch - warmup) / max(1, total - 1 - warmup)
+    return base * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+# ═══════════════════════════════════════════════════════════════════
+# 9.  Main
+# ═══════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+
+    # ── Hyper‑parameters ─────────────────────────────────────────
+    NUM_FOLDS     = 5
+    EPOCHS        = 35
+    WARMUP_EPOCHS = 3
+    BATCH_SIZE    = 8       # safe at 512 px; reduce to 6 if OOM
+    ACCUM_STEPS   = 2       # effective batch = 16
+    PATIENCE      = 8
+    HEAD_LR       = 2e-4
+    USE_AMP       = True
+    USE_COMPILE   = False   # set to False to avoid any compatibility issues
+    NUM_WORKERS   = 0       # Windows: 0  |  Linux: 2‑4
+
+    # ── Datasets ─────────────────────────────────────────────────
+    train_master = datasets.ImageFolder(TRAIN_DIR, transform=train_transforms)
+    val_master   = datasets.ImageFolder(TRAIN_DIR, transform=val_transforms)
+    dataset_size = len(train_master)
+    targets_arr  = np.array(train_master.targets)
+    num_classes  = len(train_master.classes)
+    print(f"Training images : {dataset_size}")
+    print(f"Classes ({num_classes}): {train_master.classes}")
+
+    # ── Class weights ────────────────────────────────────────────
+    counts    = Counter(train_master.targets)
+    max_cnt   = max(counts.values())
+    damp_w    = [min(max_cnt / counts[i], 3.0) for i in range(num_classes)]
+    cw_tensor = torch.FloatTensor(damp_w).to(device)
+    print(f"Max class weight: {max(damp_w):.2f}")
+
+    # ── Loss ─────────────────────────────────────────────────────
+    criterion = FocalLoss(gamma=2.0, weight=cw_tensor, label_smoothing=0.10)
+
+    # ── Cross‑validation ─────────────────────────────────────────
+    skf            = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=42)
+    fold_best_accs = []
+
+    for fold, (train_idx, val_idx) in enumerate(
+            skf.split(np.arange(dataset_size), targets_arr)):
+
+        print(f"\n{'═'*66}")
+        print(f"  FOLD {fold + 1} / {NUM_FOLDS}   "
+              f"  train {len(train_idx)}  /  val {len(val_idx)}")
+        print(f"{'═'*66}")
+
+        train_loader = DataLoader(
+            train_master, batch_size=BATCH_SIZE,
+            sampler=SubsetRandomSampler(train_idx),
+            num_workers=NUM_WORKERS, pin_memory=True,
+            persistent_workers=(NUM_WORKERS > 0),
+        )
+        val_loader = DataLoader(
+            val_master, batch_size=BATCH_SIZE * 2,
+            sampler=SubsetRandomSampler(val_idx),
+            num_workers=NUM_WORKERS, pin_memory=True,
+            persistent_workers=(NUM_WORKERS > 0),
+        )
+
+        model, param_groups, base_lrs = create_model(head_lr=HEAD_LR)
+
+        # torch.compile is off by default – safe
+        if USE_COMPILE:
+            try:
+                model = torch.compile(model)
+                print("  torch.compile: enabled ✓")
+            except Exception:
+                print("  torch.compile: not available, continuing without it")
+
+        ema    = ModelEMA(model, decay=0.9998)
+        scaler = torch.amp.GradScaler('cuda', enabled=USE_AMP)
+
+        optimizer = optim.AdamW(param_groups, weight_decay=0.05)
+
+        best_val_acc   = 0.0
+        best_ema_state = None
+        no_improve     = 0
+
+        for epoch in range(EPOCHS):
+
+            # ── Cosine warm‑up LR (per‑epoch, per‑group) ─────────
+            for pg, blr in zip(optimizer.param_groups, base_lrs):
+                pg['lr'] = cosine_warmup_lr(epoch, WARMUP_EPOCHS, EPOCHS, blr)
+
+            # ── Progressive unfreezing ───────────────────────────
+            if epoch == 0:
+                for name, p in model.named_parameters():
+                    if 'features.0' in name or 'features.1' in name:
+                        p.requires_grad_(False)
+                print("  [Warm‑up] stem + stage‑1 frozen")
+            elif epoch == WARMUP_EPOCHS:
+                for p in model.parameters():
+                    p.requires_grad_(True)
+                print(f"  [Epoch {epoch+1}] full backbone unfrozen")
+
+            # ── Train ────────────────────────────────────────────
+            model.train()
+            t_loss = t_corr = 0.0
+            optimizer.zero_grad()
+
+            for i, (inputs, labels) in enumerate(train_loader):
+                inputs, labels = inputs.to(device), labels.to(device)
+                inputs, ta, tb, lam = mixup_cutmix(inputs, labels)
+
+                with torch.amp.autocast('cuda', enabled=USE_AMP):
+                    out  = model(inputs)
+                    loss = mix_criterion(criterion, out, ta, tb, lam) / ACCUM_STEPS
+
+                scaler.scale(loss).backward()
+
+                if (i + 1) % ACCUM_STEPS == 0 or (i + 1) == len(train_loader):
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    ema.update(model)
+
+                t_loss += loss.item() * inputs.size(0) * ACCUM_STEPS
+                _, preds = torch.max(out, 1)
+                t_corr  += (lam * preds.eq(ta).sum().float()
+                            + (1.0 - lam) * preds.eq(tb).sum().float()).item()
+
+            # ── Validate (EMA model) ─────────────────────────────
+            ema.ema.eval()
+            v_loss = v_corr = 0.0
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    with torch.amp.autocast('cuda', enabled=USE_AMP):
+                        out  = ema.ema(inputs)
+                        loss = criterion(out, labels)
+                    v_loss += loss.item() * inputs.size(0)
+                    v_corr += (torch.max(out, 1)[1] == labels).sum().item()
+
+            tr_acc     = t_corr  / len(train_idx)
+            va_acc     = v_corr  / len(val_idx)
+            head_lr_now = optimizer.param_groups[-1]['lr']
+
+            print(f"  Ep {epoch+1:02d}/{EPOCHS} │ "
+                  f"loss {t_loss/len(train_idx):.4f}  acc {tr_acc:.4f} │ "
+                  f"val_loss {v_loss/len(val_idx):.4f}  val_acc {va_acc:.4f} │ "
+                  f"lr {head_lr_now:.2e}")
+
+            # ── Checkpoint & early stopping ───────────────────────
+            if va_acc > best_val_acc:
+                best_val_acc   = va_acc
+                best_ema_state = copy.deepcopy(ema.ema.state_dict())
+                torch.save(best_ema_state,
+                           os.path.join(OUTPUT_DIR, f'convnext_fold_{fold}.pth'))
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= PATIENCE:
+                    print(f"  ↳ Early stopping at epoch {epoch + 1} "
+                          f"(best val_acc {best_val_acc:.4f})")
+                    break
+
+        print(f"\n  Fold {fold + 1} best val_acc: {best_val_acc:.4f}")
+        fold_best_accs.append(best_val_acc)
+
+    print(f"\n{'═'*66}")
+    print(f"  Average CV val_acc : {np.mean(fold_best_accs):.4f}"
+          f" ± {np.std(fold_best_accs):.4f}")
+    print(f"{'═'*66}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # 10.  Inference  —  5‑fold ensemble  ×  8‑view batched TTA
+    # ═══════════════════════════════════════════════════════════════
+    print("\nLoading fold models for ensemble inference …")
+    ensemble_models = []
+    for fold in range(NUM_FOLDS):
+        m, _, _ = create_model(head_lr=HEAD_LR)
+        m.load_state_dict(torch.load(
+            os.path.join(OUTPUT_DIR, f'convnext_fold_{fold}.pth'),
+            map_location=device))
+        m.eval()
+        ensemble_models.append(m)
+
+    sub   = pd.read_csv(SAMPLE_SUB_PATH)
+    preds = []
+
+    with torch.no_grad():
+        for row_idx, row in sub.iterrows():
+            img_path = os.path.join(TEST_DIR, row['ImageName'])
+            try:
+                img = Image.open(img_path).convert('RGB')
+
+                # Stack all TTA views into a single batch [8, 3, 512, 512]
+                tta_batch = torch.stack(
+                    [t(img) for t in TTA_TRANSFORMS]
+                ).to(device)
+
+                # Accumulate probabilities (softmax‑space) across folds × views
+                prob_sum = torch.zeros(num_classes, device=device)
+                for m in ensemble_models:
+                    with torch.amp.autocast('cuda', enabled=USE_AMP):
+                        logits = m(tta_batch)                  # [8, 17]
+                    prob_sum += F.softmax(logits, dim=1).mean(0)  # average over views
+
+                prob_sum /= NUM_FOLDS                          # average over folds
+                preds.append(prob_sum.argmax().item())
+
+            except Exception as e:
+                print(f"  Skipping {row['ImageName']}: {e}")
+                preds.append(0)
+
+            # Progress print every 200 images
+            if (row_idx + 1) % 200 == 0:
+                print(f"  Inference: {row_idx + 1}/{len(sub)} done …")
+
+    sub['ClassLabel'] = preds
+    out_path = os.path.join(OUTPUT_DIR, 'submission.csv')
+    sub[['ImageName', 'ClassLabel']].to_csv(out_path, index=False)
+
+    print(f"\nSaved : {out_path}")
+    print(f"Pred dist : {dict(sorted(Counter(preds).items()))}")
