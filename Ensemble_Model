@@ -1,0 +1,663 @@
+import copy, random, math, os
+import numpy as np
+import pandas as pd
+from PIL import Image
+from collections import Counter
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+import torchvision.models as models
+
+try:
+    import timm
+    HAS_TIMM = True
+except ImportError:
+    HAS_TIMM = False
+    print("WARNING: timm not installed — pip install timm")
+
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.model_selection import StratifiedKFold
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+SEED         = 42
+IMG_SIZE     = 192
+BATCH_SIZE   = 4
+EPOCHS       = 20
+NUM_CLASSES  = 17
+NUM_FOLDS    = 2
+PSEUDO_CONF  = 0.92
+MIXUP_ALPHA  = 0.4
+CUTMIX_ALPHA = 1.0
+LABEL_SMOOTH = 0.05
+
+NUM_GPUS = torch.cuda.device_count()
+print(f"GPUs available: {NUM_GPUS}")
+
+TRAIN_DIR  = '/kaggle/input/competitions/cse-281-spring-26-scene-style-classification/StyleClassificationIndoors/StyleClassificationIndoors/train'
+TEST_DIR   = '/kaggle/input/competitions/cse-281-spring-26-scene-style-classification/StyleClassificationIndoors/StyleClassificationIndoors/test'
+SAMPLE_SUB = '/kaggle/working/sample_submission.csv'
+OUTPUT_DIR = '/kaggle/working'
+
+LABEL_MAP = {
+    "asian": 0, "boho": 1, "coastal": 2, "contemporary": 3,
+    "craftsman": 4, "eclectic": 5, "farmhouse": 6, "french-country": 7,
+    "industrial": 8, "mediterranean": 9, "minimalist": 10, "modern": 11,
+    "scandinavian": 12, "shabby-chic-style": 13, "southwestern": 14,
+    "tropical": 15, "victorian": 16
+}
+IDX_TO_CLASS = {v: k for k, v in LABEL_MAP.items()}
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = True
+
+set_seed()
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MEAN = [0.485, 0.456, 0.406]
+STD  = [0.229, 0.224, 0.225]
+
+train_transform = T.Compose([
+    T.Resize((IMG_SIZE + 64, IMG_SIZE + 64)),
+    T.RandomCrop(IMG_SIZE),
+    T.RandomHorizontalFlip(),
+    T.RandomVerticalFlip(p=0.05),
+    T.RandomApply([T.RandomRotation(20)], p=0.4),
+    T.RandomApply([T.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.2, hue=0.06)], p=0.7),
+    T.RandomApply([T.GaussianBlur(kernel_size=3)], p=0.2),
+    T.RandomGrayscale(p=0.03),
+    T.ToTensor(),
+    T.Normalize(MEAN, STD),
+    T.RandomErasing(p=0.25, scale=(0.02, 0.15)),
+])
+
+val_transform = T.Compose([
+    T.Resize((IMG_SIZE, IMG_SIZE)),
+    T.ToTensor(),
+    T.Normalize(MEAN, STD),
+])
+
+TTA_TRANSFORMS = [
+    T.Compose([T.Resize((IMG_SIZE, IMG_SIZE)),                                                                   T.ToTensor(), T.Normalize(MEAN, STD)]),
+    T.Compose([T.Resize((IMG_SIZE, IMG_SIZE)),       T.RandomHorizontalFlip(1),                                  T.ToTensor(), T.Normalize(MEAN, STD)]),
+    T.Compose([T.Resize((IMG_SIZE+64, IMG_SIZE+64)), T.CenterCrop(IMG_SIZE),                                     T.ToTensor(), T.Normalize(MEAN, STD)]),
+    T.Compose([T.Resize((IMG_SIZE+64, IMG_SIZE+64)), T.CenterCrop(IMG_SIZE),  T.RandomHorizontalFlip(1),         T.ToTensor(), T.Normalize(MEAN, STD)]),
+    T.Compose([T.Resize((IMG_SIZE+64, IMG_SIZE+64)), T.RandomCrop(IMG_SIZE),                                     T.ToTensor(), T.Normalize(MEAN, STD)]),
+    T.Compose([T.Resize((IMG_SIZE+64, IMG_SIZE+64)), T.RandomCrop(IMG_SIZE),  T.RandomHorizontalFlip(1),         T.ToTensor(), T.Normalize(MEAN, STD)]),
+    T.Compose([T.Resize((IMG_SIZE, IMG_SIZE)),       T.ColorJitter(brightness=0.1),                              T.ToTensor(), T.Normalize(MEAN, STD)]),
+    T.Compose([T.Resize((IMG_SIZE, IMG_SIZE)),       T.ColorJitter(contrast=0.1),                                T.ToTensor(), T.Normalize(MEAN, STD)]),
+    T.Compose([T.Resize((IMG_SIZE+32, IMG_SIZE+32)), T.FiveCrop(IMG_SIZE), T.Lambda(lambda crops: torch.stack([T.Compose([T.ToTensor(), T.Normalize(MEAN, STD)])(c) for c in crops]))]),
+    T.Compose([T.Resize((IMG_SIZE, IMG_SIZE)),       T.RandomRotation(10),                                       T.ToTensor(), T.Normalize(MEAN, STD)]),
+]
+TTA_FIVECROP_IDX = 8
+
+
+class SceneDataset(Dataset):
+    def __init__(self, df, img_dir, transform=None, is_test=False):
+        self.df        = df.reset_index(drop=True)
+        self.img_dir   = img_dir
+        self.transform = transform
+        self.is_test   = is_test
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        img_name = self.df.loc[idx, "ImageName"]
+        image    = Image.open(os.path.join(self.img_dir, img_name)).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        if self.is_test:
+            return image, img_name
+        return image, int(self.df.loc[idx, "ClassLabel"])
+
+
+def build_dataframe(root_dir):
+    records = []
+    for class_name, label in LABEL_MAP.items():
+        class_dir = os.path.join(root_dir, class_name)
+        if not os.path.isdir(class_dir):
+            continue
+        for fname in os.listdir(class_dir):
+            if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                records.append({"ImageName": os.path.join(class_name, fname),
+                                 "ClassLabel": label})
+    df = pd.DataFrame(records)
+    print(f"Total training images: {len(df)}")
+    return df
+
+
+def compute_class_weights(df):
+    counts    = Counter(df["ClassLabel"].tolist())
+    max_count = max(counts.values())
+    weights   = [min(max_count / counts.get(i, 1), 4.0) for i in range(NUM_CLASSES)]
+    return torch.FloatTensor(weights).to(DEVICE)
+
+
+def _head(in_features):
+    return nn.Sequential(
+        nn.Linear(in_features, 768),
+        nn.LayerNorm(768),
+        nn.GELU(),
+        nn.Dropout(0.35),
+        nn.Linear(768, 256),
+        nn.GELU(),
+        nn.Dropout(0.2),
+        nn.Linear(256, NUM_CLASSES),
+    )
+
+
+def wrap_model(model):
+    return model.to(DEVICE)
+
+def unwrap(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def create_convnext():
+    model = models.convnext_large(weights=models.ConvNeXt_Large_Weights.DEFAULT)
+    in_f  = model.classifier[2].in_features
+    model.classifier[2] = _head(in_f)
+    return wrap_model(model)
+
+
+def create_efficientnet():
+    model = models.efficientnet_v2_l(weights=models.EfficientNet_V2_L_Weights.DEFAULT)
+    in_f  = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.4),
+        nn.Linear(in_f, 768),
+        nn.SiLU(),
+        nn.Dropout(0.3),
+        nn.Linear(768, 256),
+        nn.SiLU(),
+        nn.Dropout(0.2),
+        nn.Linear(256, NUM_CLASSES),
+    )
+    return wrap_model(model)
+
+
+def create_swin():
+    model = models.swin_v2_b(weights=models.Swin_V2_B_Weights.DEFAULT)
+    in_f  = model.head.in_features
+    model.head = _head(in_f)
+    return wrap_model(model)
+
+
+def create_vit():
+    if not HAS_TIMM:
+        raise RuntimeError("pip install timm")
+    model = timm.create_model('vit_large_patch16_224', pretrained=True,
+                               num_classes=0, drop_path_rate=0.2)
+    in_f  = model.num_features
+    class ViTWrapper(nn.Module):
+        def __init__(self, backbone, head):
+            super().__init__()
+            self.backbone = backbone
+            self.head     = head
+        def forward(self, x):
+            return self.head(self.backbone(x))
+    return wrap_model(ViTWrapper(model, _head(in_f)))
+
+
+BACKBONES = {
+    "convnext":     create_convnext,
+    "efficientnet": create_efficientnet,
+}
+if HAS_TIMM:
+    BACKBONES["vit"] = create_vit
+
+
+class SmoothCrossEntropy(nn.Module):
+    def __init__(self, smoothing=LABEL_SMOOTH, weight=None):
+        super().__init__()
+        self.smoothing = smoothing
+        self.weight    = weight
+
+    def forward(self, pred, target):
+        n = pred.size(1)
+        with torch.no_grad():
+            smooth = torch.full_like(pred, self.smoothing / (n - 1))
+            smooth.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+        log_prob = F.log_softmax(pred, dim=1)
+        if self.weight is not None:
+            loss = -(smooth * log_prob)
+            w    = self.weight[target].unsqueeze(1)
+            loss = (loss * w).sum(dim=1).mean()
+        else:
+            loss = -(smooth * log_prob).sum(dim=1).mean()
+        return loss
+
+
+def mixup_data(x, y):
+    lam   = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
+    index = torch.randperm(x.size(0)).to(DEVICE)
+    return lam * x + (1 - lam) * x[index], y, y[index], lam
+
+
+def rand_bbox(size, lam):
+    W, H  = size[2], size[3]
+    cut_w = int(W * math.sqrt(1 - lam))
+    cut_h = int(H * math.sqrt(1 - lam))
+    cx    = random.randint(0, W)
+    cy    = random.randint(0, H)
+    return (max(cx - cut_w//2, 0), max(cy - cut_h//2, 0),
+            min(cx + cut_w//2, W), min(cy + cut_h//2, H))
+
+
+def cutmix_data(x, y):
+    lam             = np.random.beta(CUTMIX_ALPHA, CUTMIX_ALPHA)
+    index           = torch.randperm(x.size(0)).to(DEVICE)
+    x1, y1, x2, y2 = rand_bbox(x.size(), lam)
+    x_mix           = x.clone()
+    x_mix[:, :, x1:x2, y1:y2] = x[index, :, x1:x2, y1:y2]
+    lam_adj         = 1 - (x2-x1)*(y2-y1) / (x.size(2)*x.size(3))
+    return x_mix, y, y[index], lam_adj
+
+
+def mixed_criterion(criterion, pred, ya, yb, lam):
+    return lam * criterion(pred, ya) + (1 - lam) * criterion(pred, yb)
+
+
+def get_lr_lambda(epoch):
+    warmup = 3
+    if epoch < warmup:
+        return (epoch + 1) / warmup
+    progress = (epoch - warmup) / max(EPOCHS - warmup, 1)
+    return 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def get_param_groups(backbone_name, model):
+    raw = unwrap(model)
+    if backbone_name in ("convnext", "efficientnet"):
+        bp = list(raw.features.parameters())
+        hp = list(raw.classifier.parameters())
+    elif backbone_name == "swin":
+        bp = [p for n, p in raw.named_parameters() if 'head' not in n]
+        hp = list(raw.head.parameters())
+    elif backbone_name == "vit":
+        bp = list(raw.backbone.parameters())
+        hp = list(raw.head.parameters())
+    else:
+        return [{'params': raw.parameters(), 'lr': 2e-4}]
+
+    n = len(bp); t = n // 3
+    return [
+        {'params': bp[:t],    'lr': 5e-6},
+        {'params': bp[t:2*t], 'lr': 1e-5},
+        {'params': bp[2*t:],  'lr': 3e-5},
+        {'params': hp,        'lr': 2e-4},
+    ]
+
+
+def make_loader(dataset, batch_size, shuffle):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=False,
+    )
+
+
+def train_fold(backbone_name, fold, train_idx, val_idx, df, class_weights):
+    print(f"\n{'─'*60}")
+    print(f"  [{backbone_name.upper()}] FOLD {fold+1}/{NUM_FOLDS}")
+    print(f"{'─'*60}")
+
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df   = df.iloc[val_idx].reset_index(drop=True)
+
+    bs           = BATCH_SIZE * NUM_GPUS
+    train_loader = make_loader(SceneDataset(train_df, TRAIN_DIR, train_transform), bs, True)
+    val_loader   = make_loader(SceneDataset(val_df,   TRAIN_DIR, val_transform),   bs, False)
+
+    print(f"  Loaders ready — {len(train_loader)} train batches, {len(val_loader)} val batches")
+
+    model     = BACKBONES[backbone_name]()
+    criterion = SmoothCrossEntropy(weight=class_weights)
+    optimizer = optim.AdamW(get_param_groups(backbone_name, model), weight_decay=1e-2)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=get_lr_lambda)
+    scaler    = torch.amp.GradScaler('cuda')
+
+    print(f"  Model ready — starting epochs…")
+
+    best_val_acc = 0.0
+    best_weights = None
+    patience_ctr = 0
+    patience     = 10
+
+    for epoch in range(EPOCHS):
+        model.train()
+        train_correct = train_total = 0
+        aug_type = "---"
+
+        for images, labels in train_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+            r = random.random()
+            if epoch >= 4 and r < 0.40:
+                images, ya, yb, lam = cutmix_data(images, labels)
+                aug_type = "cut"
+            elif epoch >= 4 and r < 0.70:
+                images, ya, yb, lam = mixup_data(images, labels)
+                aug_type = "mix"
+            else:
+                ya, yb, lam = labels, labels, 1.0
+                aug_type = "---"
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda'):
+                out  = model(images)
+                loss = mixed_criterion(criterion, out, ya, yb, lam)
+
+            if not torch.isfinite(loss):
+                print(f"    ⚠ Non-finite loss at epoch {epoch+1}, skipping batch")
+                continue
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_correct += (out.detach().argmax(1) == labels).sum().item()
+            train_total   += labels.size(0)
+
+        model.eval()
+        val_correct = val_total = val_loss_sum = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                with torch.amp.autocast('cuda'):
+                    out = model(images)
+                val_loss_sum += criterion(out, labels).item() * labels.size(0)
+                val_correct  += (out.argmax(1) == labels).sum().item()
+                val_total    += labels.size(0)
+
+        train_acc = train_correct / max(train_total, 1) * 100
+        val_acc   = val_correct   / max(val_total,   1) * 100
+        val_loss  = val_loss_sum  / max(val_total,   1)
+        cur_lr    = optimizer.param_groups[-1]['lr']
+        scheduler.step()
+
+        print(f"  E{epoch+1:02d} [{aug_type}] Train:{train_acc:.1f}%  "
+              f"Val:{val_acc:.1f}%  Loss:{val_loss:.4f}  LR:{cur_lr:.2e}")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_weights = copy.deepcopy(unwrap(model).state_dict())
+            patience_ctr = 0
+            save_path    = os.path.join(OUTPUT_DIR, f"best_{backbone_name}_fold{fold}.pth")
+            torch.save(best_weights, save_path)
+            print(f"    ✓ New best {best_val_acc:.2f}% → {save_path}")
+        else:
+            patience_ctr += 1
+            if patience_ctr >= patience:
+                print(f"    Early stop at epoch {epoch+1}")
+                break
+
+    return best_weights, best_val_acc
+
+
+def run_training(df):
+    class_weights = compute_class_weights(df)
+    skf     = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=SEED)
+    labels  = df["ClassLabel"].values
+    all_results = {}
+
+    for backbone_name in BACKBONES:
+        print(f"\n{'═'*60}\n  BACKBONE: {backbone_name.upper()}\n{'═'*60}")
+        results = []
+        for fold, (train_idx, val_idx) in enumerate(skf.split(df, labels)):
+            torch.cuda.empty_cache()   # ← add this line
+            w, acc = train_fold(backbone_name, fold, train_idx, val_idx,
+                                df, class_weights)
+            results.append((w, acc))
+        accs = [r[1] for r in results]
+        print(f"\n  {backbone_name.upper()} folds: {[f'{a:.1f}' for a in accs]} "
+              f"| mean: {np.mean(accs):.2f}%")
+        all_results[backbone_name] = results
+
+    return all_results
+
+def generate_submission(all_results):
+    print(f"\n{'═'*60}\n  SUBMISSION — Weighted Ensemble + 10x TTA\n{'═'*60}")
+
+    flat = [(bn, fold, w, acc)
+            for bn, results in all_results.items()
+            for fold, (w, acc) in enumerate(results)]
+
+    accs        = np.array([x[3] for x in flat])
+    raw_weights = np.exp(accs / 10)
+    ens_weights = raw_weights / raw_weights.sum()
+
+    ensemble_models = []
+    for (bn, fold, w, acc), ew in zip(flat, ens_weights):
+        m = BACKBONES[bn]()
+        unwrap(m).load_state_dict(w)
+        m.eval()
+        ensemble_models.append((m, ew))
+        print(f"  {bn} fold{fold+1}  val={acc:.2f}%  weight={ew:.4f}")
+
+    sample    = pd.read_csv(SAMPLE_SUB)
+    preds     = []
+    all_probs = []
+
+    with torch.no_grad():
+        for idx, row in sample.iterrows():
+            if idx % 200 == 0:
+                print(f"  [{idx+1}/{len(sample)}]…")
+            try:
+                img = Image.open(os.path.join(TEST_DIR, row["ImageName"])).convert("RGB")
+            except Exception:
+                preds.append(0)
+                all_probs.append([1/NUM_CLASSES]*NUM_CLASSES)
+                continue
+            logits = torch.zeros(1, NUM_CLASSES).to(DEVICE)
+
+            for model, ew in ensemble_models:
+                for t_idx, tfm in enumerate(TTA_TRANSFORMS):
+                    if t_idx == TTA_FIVECROP_IDX:
+                        crops = tfm(img).to(DEVICE)
+                        with torch.amp.autocast('cuda'):
+                            logits += ew * model(crops).mean(0, keepdim=True)
+                    else:
+                        tensor = tfm(img).unsqueeze(0).to(DEVICE)
+                        with torch.amp.autocast('cuda'):
+                            logits += ew * model(tensor)
+
+            probs = F.softmax(logits, dim=1).cpu().numpy()[0]
+            preds.append(logits.argmax(dim=1).item())
+            all_probs.append(probs)
+
+    pd.DataFrame({"ImageName": sample["ImageName"],
+                  "ClassLabel": preds}).to_csv(
+        os.path.join(OUTPUT_DIR, "submission.csv"), index=False)
+
+    prob_df = pd.DataFrame(all_probs, columns=list(LABEL_MAP.keys()))
+    prob_df.insert(0, "ImageName", sample["ImageName"])
+    prob_df.to_csv(os.path.join(OUTPUT_DIR, "submission_probs.csv"), index=False)
+
+    print(f"\n  ✓ submission.csv ({len(preds)} predictions)")
+    for label, count in sorted(Counter(preds).items()):
+        print(f"    {IDX_TO_CLASS[label]:25s}: {count}")
+
+def finetune_with_pseudo(all_results, train_df, pseudo_df):
+    return all_results
+def generate_pseudo_labels(all_results):
+    print(f"\n{'═'*60}\n  PSEUDO-LABELING (threshold={PSEUDO_CONF})\n{'═'*60}")
+    sample    = pd.read_csv(SAMPLE_SUB)
+    all_probs = torch.zeros(len(sample), NUM_CLASSES).to(DEVICE)
+    n_models  = 0
+
+    with torch.no_grad():
+        for backbone_name, results in all_results.items():
+            for (weights, _) in results:
+                model = BACKBONES[backbone_name]()
+                unwrap(model).load_state_dict(weights)
+                model.eval()
+                for idx, row in sample.iterrows():
+                    try:
+                        img    = Image.open(os.path.join(TEST_DIR, row["ImageName"])).convert("RGB")
+                        tensor = val_transform(img).unsqueeze(0).to(DEVICE)
+                        with torch.amp.autocast('cuda'):
+                            all_probs[idx] += F.softmax(model(tensor), dim=1).squeeze()
+                    except Exception:
+                        continue
+                n_models += 1
+
+    all_probs /= n_models
+    max_probs, pred_labels = all_probs.max(dim=1)
+    mask      = max_probs.cpu() >= PSEUDO_CONF
+    pseudo_df = pd.DataFrame({
+        "ImageName":  sample["ImageName"][mask.numpy()].values,
+        "ClassLabel": pred_labels.cpu()[mask].numpy()
+    })
+    print(f"  Pseudo-labeled {len(pseudo_df)}/{len(sample)} images")
+    return pseudo_df
+def generate_submission(all_results):
+    print(f"\n{'═'*60}\n  SUBMISSION — Weighted Ensemble + 10x TTA\n{'═'*60}")
+
+    flat = [(bn, fold, w, acc)
+            for bn, results in all_results.items()
+            for fold, (w, acc) in enumerate(results)]
+
+    accs        = np.array([x[3] for x in flat])
+    raw_weights = np.exp(accs / 10)
+    ens_weights = raw_weights / raw_weights.sum()
+
+    ensemble_models = []
+    for (bn, fold, w, acc), ew in zip(flat, ens_weights):
+        m = BACKBONES[bn]()
+        unwrap(m).load_state_dict(w)
+        m.eval()
+        ensemble_models.append((m, ew))
+        print(f"  {bn} fold{fold+1}  val={acc:.2f}%  weight={ew:.4f}")
+
+    sample    = pd.read_csv(SAMPLE_SUB)
+    preds     = []
+    all_probs = []
+
+    with torch.no_grad():
+        for idx, row in sample.iterrows():
+            if idx % 200 == 0:
+                print(f"  [{idx+1}/{len(sample)}]…")
+            try:
+                img = Image.open(os.path.join(TEST_DIR, row["ImageName"])).convert("RGB")
+            except Exception:
+                preds.append(0)
+                all_probs.append([1/NUM_CLASSES]*NUM_CLASSES)
+                continue
+            logits = torch.zeros(1, NUM_CLASSES).to(DEVICE)
+
+            for model, ew in ensemble_models:
+                for t_idx, tfm in enumerate(TTA_TRANSFORMS):
+                    if t_idx == TTA_FIVECROP_IDX:
+                        crops = tfm(img).to(DEVICE)
+                        with torch.amp.autocast('cuda'):
+                            logits += ew * model(crops).mean(0, keepdim=True)
+                    else:
+                        tensor = tfm(img).unsqueeze(0).to(DEVICE)
+                        with torch.amp.autocast('cuda'):
+                            logits += ew * model(tensor)
+
+            probs = F.softmax(logits, dim=1).cpu().numpy()[0]
+            preds.append(logits.argmax(dim=1).item())
+            all_probs.append(probs)
+
+    pd.DataFrame({"ImageName": sample["ImageName"],
+                  "ClassLabel": preds}).to_csv(
+        os.path.join(OUTPUT_DIR, "submission.csv"), index=False)
+
+    prob_df = pd.DataFrame(all_probs, columns=list(LABEL_MAP.keys()))
+    prob_df.insert(0, "ImageName", sample["ImageName"])
+    prob_df.to_csv(os.path.join(OUTPUT_DIR, "submission_probs.csv"), index=False)
+
+    print(f"\n  ✓ submission.csv ({len(preds)} predictions)")
+    for label, count in sorted(Counter(preds).items()):
+        print(f"    {IDX_TO_CLASS[label]:25s}: {count}")
+
+def evaluate(all_results, df):
+    print(f"\n{'═'*60}\n  EVALUATION\n{'═'*60}")
+    backbone_name = list(all_results.keys())[0]
+    weights, _    = max(all_results[backbone_name], key=lambda x: x[1])
+    model = BACKBONES[backbone_name]()
+    unwrap(model).load_state_dict(weights)
+    model.eval()
+
+    split    = int(len(df) * 0.8)
+    eval_df  = df[split:].reset_index(drop=True)
+    loader   = make_loader(SceneDataset(eval_df, TRAIN_DIR, val_transform),
+                           BATCH_SIZE * NUM_GPUS, False)
+    preds, labels_all = [], []
+    with torch.no_grad():
+        for imgs, lbls in loader:
+            with torch.amp.autocast('cuda'):
+                preds.extend(model(imgs.to(DEVICE)).argmax(1).cpu().numpy())
+            labels_all.extend(lbls.numpy())
+
+    print(f"\n  Accuracy: {accuracy_score(labels_all, preds)*100:.2f}%")
+    print(classification_report(labels_all, preds, target_names=list(LABEL_MAP.keys())))
+
+    cm = confusion_matrix(labels_all, preds)
+    plt.figure(figsize=(16, 14))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=list(LABEL_MAP.keys()),
+                yticklabels=list(LABEL_MAP.keys()))
+    plt.title("Confusion Matrix")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "confusion_matrix.png"), dpi=150)
+    plt.show()
+if __name__ == "__main__":
+    print("\n[1/5] Building dataset…")
+    df = build_dataframe(TRAIN_DIR)
+    df = df.sample(frac=1, random_state=SEED).reset_index(drop=True)
+
+    test_files = sorted(os.listdir(TEST_DIR))
+    pd.DataFrame({
+        "ImageName": test_files,
+        "ClassLabel": [0] * len(test_files)
+    }).to_csv(SAMPLE_SUB, index=False)
+    print(f"  Created sample_submission.csv with {len(test_files)} test images")
+
+    print("\n[2/5] Loading saved weights…")
+    all_results = {}
+    for backbone_name in BACKBONES:
+        results = []
+        for fold in range(NUM_FOLDS):
+            path = os.path.join(OUTPUT_DIR, f"best_{backbone_name}_fold{fold}.pth")
+            if not os.path.exists(path):
+                print(f"  Skipping {path} — not found")
+                continue
+            weights = torch.load(path, map_location=DEVICE)
+            results.append((weights, 0.0))
+            print(f"  Loaded {path}")
+        all_results[backbone_name] = results
+
+    print("\n[3/5] Generating pseudo labels…")
+    pseudo_df = generate_pseudo_labels(all_results)
+
+    print("\n[4/5] Fine-tuning…")
+    if len(pseudo_df) > 100:
+        all_results = finetune_with_pseudo(all_results, df, pseudo_df)
+    else:
+        print("  Skipping")
+
+    print("\n[5/5] Generating submission…")
+    generate_submission(all_results)
+    print(f"\n✓ Done!")
+ 
